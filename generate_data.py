@@ -1,34 +1,81 @@
 #!/usr/bin/env python3
 """
-generate_data_fixed.py
-Quick-fix version that avoids Flash Attention import (GLIBC issues) and uses `dtype`.
+generate_data.py
+
+Grounded synthetic SFT/DPO data generator for SAT.
+
+Replaces the prior version, which generated generic shopping-assistant Q&A
+(camera bags, craft gifts, gaming keyboards) with zero connection to phones
+or to any review evidence. This version is grounded end-to-end:
+
+  1. Samples a product from the TRAIN split (dataset/sat/product_splits.json)
+     -- eval-split products are never touched here, so the later evaluation
+     set is genuinely held out.
+  2. Uses the real Librarian (librarian.py) to retrieve real evidence
+     sentences for a persona-biased aspect on that product.
+  3. Teacher LLM generates a natural question for that persona/aspect.
+  4. "chosen":
+       - if enough evidence was retrieved: an answer generated WITH the
+         evidence in context, constrained to it (grounded_aspect example).
+       - if not: a deterministic, templated abstention response (no LLM
+         call needed -- correctness of the safety-critical "chosen" side
+         of an abstention pair shouldn't depend on generation quality).
+  5. "rejected": the SAME question answered by the SAME model with NO
+     evidence access at all. This is a principled way to get a realistic
+     contrastive negative (naturally generic / prone to hallucination
+     since the model has nothing to ground on) instead of instructing the
+     model to "write a bad answer" on command.
+
+Every example carries provenance (parent_asin, aspect, persona, category,
+evidence review_ids) for later leakage/quality auditing -- required before
+trusting any downstream SFT/DPO run on this data.
+
+Usage:
+  python generate_data.py --n 20 --out smoke_test_data.json      # smoke test
+  python generate_data.py --n 800 --out synthetic_dpo_data.json  # real run
 """
 
+import argparse
 import json
-import math
+import os
 import random
-import time
-from tqdm import tqdm
+import warnings
+warnings.filterwarnings("ignore", message=".*Failed to load image Python extension.*")
 
 import torch
+from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
-# ------------- CONFIG -------------
-MODEL_ID = "NousResearch/Meta-Llama-3-8B-Instruct"  # may require HF auth
-OUTPUT_FILE = "synthetic_dpo_data.json"
-N_SAMPLES = 1000
-BATCH_SIZE = 8
-MAX_NEW_TOKENS = 512
-TEMPERATURE = 0.8
-# -----------------------------------
+from librarian import Librarian
 
-PERSONAS = ["Pro Gamer", "Budget Student", "Professional Photographer", "Grandmother buying gifts"]
+MODEL_ID = "NousResearch/Meta-Llama-3-8B-Instruct"
+SPLIT_FILE = "dataset/sat/product_splits.json"
+
+BATCH_SIZE = 8
+MAX_NEW_TOKENS_Q = 40
+MAX_NEW_TOKENS_ANS = 200
+
+ASPECTS = [
+    "battery life", "camera quality", "display quality", "performance and speed",
+    "build quality and durability", "value for money", "ease of use", "overall product quality",
+]
+
+PERSONA_ASPECT_BIAS = {
+    "Budget Student": ["value for money", "battery life", "build quality and durability"],
+    "Professional Photographer": ["camera quality", "display quality"],
+    "Pro Gamer": ["performance and speed", "display quality", "battery life"],
+    "Frequent Traveler": ["battery life", "build quality and durability", "value for money"],
+    "App Developer": ["performance and speed", "overall product quality"],
+}
+PERSONAS = list(PERSONA_ASPECT_BIAS.keys())
+
+MIN_SCORE = 0.55
+MIN_EVIDENCE_SENTENCES = 3
+
 
 def safe_dtype():
-    """Return a dtype safe to pass to from_pretrained (or None)."""
     if not torch.cuda.is_available():
         return None
-    # prefer bfloat16 only when CUDA + driver supports it
     try:
         if torch.cuda.is_bf16_supported():
             return torch.bfloat16
@@ -36,133 +83,186 @@ def safe_dtype():
         pass
     return None
 
+
 def get_generator():
-    """Load tokenizer + model and return a text-generation pipeline.
-    Avoids passing attn_implementation to prevent lazy import of flash_attn.
-    Uses `dtype` (transformers deprecation fix) and falls back on low_cpu_mem_usage.
-    """
-    print(f"Loading Teacher Model: {MODEL_ID}...")
+    print(f"Loading Teacher Model: {MODEL_ID} ...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"  # correct for batched causal-LM generation
 
     dtype = safe_dtype()
     model_kwargs = dict(device_map="auto", trust_remote_code=True)
     if dtype is not None:
         model_kwargs["dtype"] = dtype
-
-    try:
-        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
-    except Exception as e:
-        print("Primary model load failed, retrying with low_cpu_mem_usage=True. Error:", e)
-        try:
-            model = AutoModelForCausalLM.from_pretrained(MODEL_ID, low_cpu_mem_usage=True, **model_kwargs)
-        except Exception as e2:
-            # Last resort: attempt CPU load (very slow) so the script fails more informatively
-            print("Retry with CPU (very slow). Error:", e2)
-            model = AutoModelForCausalLM.from_pretrained(MODEL_ID, device_map={"": "cpu"}, trust_remote_code=True)
-
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
     gen = pipeline("text-generation", model=model, tokenizer=tokenizer, batch_size=BATCH_SIZE)
     return gen
 
-def prompt_from_persona(persona):
-    sys_msg = (
-        "You are a synthetic data generator. Create a DPO training example for a Shopping Assistant.\n"
-        f"Context: The user is a {persona}.\n"
-        "Generate a JSON object with 3 fields:\n"
-        "1. 'user_query': A plausible shopping question.\n"
-        "2. 'chosen': A helpful, persona-aware, safe response.\n"
-        "3. 'rejected': A generic, robotic, or slightly hallucinated response.\n"
-        "Output ONLY valid JSON.\n"
-        "Respond with the JSON object only."
+
+def chat_prompt(tokenizer, system, user):
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def pick_aspect(persona):
+    if random.random() < 0.7 and persona in PERSONA_ASPECT_BIAS:
+        return random.choice(PERSONA_ASPECT_BIAS[persona])
+    return random.choice(ASPECTS)
+
+
+def gen_batch(gen, prompts, max_new_tokens, temperature):
+    if not prompts:
+        return []
+    outs = gen(
+        prompts, max_new_tokens=max_new_tokens, temperature=temperature, do_sample=temperature > 0,
+        return_full_text=False, pad_token_id=gen.tokenizer.eos_token_id,
     )
-    return sys_msg + "\nGenerate example."
+    results = []
+    for o in outs:
+        if isinstance(o, list):
+            o = o[0]
+        results.append(o.get("generated_text", "").strip())
+    return results
 
-def generate_prompt_batch(personas, batch_size):
-    return [prompt_from_persona(random.choice(personas)) for _ in range(batch_size)]
-
-def extract_first_json(raw_text):
-    """Extract first JSON object found in raw_text. Return dict or None."""
-    start = raw_text.find('{')
-    end = raw_text.rfind('}') + 1
-    if start == -1 or end == 0 or end <= start:
-        return None
-    candidate = raw_text[start:end]
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
 
 def main():
-    pipe = get_generator()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=20, help="number of examples to generate")
+    ap.add_argument("--out", type=str, default="synthetic_dpo_data.json")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--resume", action="store_true", help="continue an interrupted run by loading --out if it exists")
+    args = ap.parse_args()
+
+    random.seed(args.seed)
+
+    splits = json.load(open(SPLIT_FILE))
+    train_asins = splits["train_asins"]
+    print(f"Train products available: {len(train_asins)} (eval products excluded: {len(splits['eval_asins'])})")
+
+    print("Loading Librarian (BLAIR retriever + product review store)...")
+    lib = Librarian()
+
+    gen = get_generator()
+
     dataset = []
+    if args.resume and os.path.exists(args.out):
+        with open(args.out) as f:
+            dataset = json.load(f)
+        print(f"Resuming from {args.out}: {len(dataset)} examples already generated.")
 
-    print(f"Generating up to {N_SAMPLES} synthetic samples (batch size {BATCH_SIZE})...")
-    n_batches = math.ceil(N_SAMPLES / BATCH_SIZE)
+    pbar = tqdm(total=args.n, initial=len(dataset), desc="Generating")
 
-    for _ in tqdm(range(n_batches)):
-        prompts = generate_prompt_batch(PERSONAS, BATCH_SIZE)
-        try:
-            results = pipe(
-                prompts,
-                max_new_tokens=MAX_NEW_TOKENS,
-                temperature=TEMPERATURE,
-                do_sample=True,
-                return_full_text=False
+    while len(dataset) < args.n:
+        b = min(BATCH_SIZE, args.n - len(dataset))
+
+        picks = []
+        for _ in range(b):
+            asin = random.choice(train_asins)
+            persona = random.choice(PERSONAS)
+            aspect = pick_aspect(persona)
+            picks.append({"asin": asin, "persona": persona, "aspect": aspect})
+
+        for p in picks:
+            cur = lib._conn.cursor()
+            cur.execute("SELECT product_title FROM reviews WHERE parent_asin=? LIMIT 1", (p["asin"],))
+            row = cur.fetchone()
+            p["product_title"] = row[0] if row else "this phone"
+
+            retrieval = lib.retrieve_and_prune(p["asin"], p["aspect"], top_k=8, mode="hybrid", min_score=MIN_SCORE)
+            p["evidence"] = [r["sentence"] for r in retrieval["results"]]
+            p["evidence_review_ids"] = [r["review_id"] for r in retrieval["results"]]
+            p["sufficient_evidence"] = len(p["evidence"]) >= MIN_EVIDENCE_SENTENCES
+
+        # Stage 1: question generation
+        q_prompts = [
+            chat_prompt(
+                gen.tokenizer,
+                "You write realistic, specific shopping questions a customer would ask about a smartphone. "
+                "Output ONLY the question, one sentence, no preamble or quotes.",
+                f"Persona: {p['persona']}\nAspect to ask about: {p['aspect']}\n"
+                f"Write one natural question this persona would ask about a smartphone's {p['aspect']}.",
             )
-        except Exception as e:
-            print("Generation error, sleeping 5s and retrying batch. Error:", e)
-            time.sleep(5)
-            try:
-                results = pipe(prompts, max_new_tokens=MAX_NEW_TOKENS, temperature=TEMPERATURE, do_sample=True, return_full_text=False)
-            except Exception as e2:
-                print("Retry failed; skipping this batch. Error:", e2)
+            for p in picks
+        ]
+        questions = gen_batch(gen, q_prompts, MAX_NEW_TOKENS_Q, temperature=0.9)
+        for p, q in zip(picks, questions):
+            p["question"] = q.strip().strip('"').strip()
+
+        # Stage 2: grounded "chosen" (evidence-sufficient picks only)
+        grounded_idx = [i for i, p in enumerate(picks) if p["sufficient_evidence"] and p["question"]]
+        grounded_prompts = [
+            chat_prompt(
+                gen.tokenizer,
+                "You are a helpful shopping assistant. Answer the user's question using ONLY the evidence "
+                "below, drawn from real customer reviews. Do not invent facts not present in the evidence. "
+                "Adapt tone to the persona. If the evidence is mixed or contradictory, say so explicitly. "
+                "Keep the answer to 3-5 sentences.",
+                f"Persona: {picks[i]['persona']}\nProduct: {picks[i]['product_title']}\n"
+                f"Question: {picks[i]['question']}\n\nEvidence from customer reviews:\n"
+                + "\n".join(f"- {s}" for s in picks[i]["evidence"]),
+            )
+            for i in grounded_idx
+        ]
+        grounded_answers = gen_batch(gen, grounded_prompts, MAX_NEW_TOKENS_ANS, temperature=0.3)
+        for i, ans in zip(grounded_idx, grounded_answers):
+            picks[i]["chosen"] = ans.strip()
+
+        # Stage 3: ungrounded answer -- used as "rejected" for both categories
+        ug_idx = [i for i, p in enumerate(picks) if p["question"]]
+        ungrounded_prompts = [
+            chat_prompt(
+                gen.tokenizer,
+                "You are a helpful shopping assistant. Answer the user's question as best you can. "
+                "Adapt tone to the persona. Keep the answer to 3-5 sentences.",
+                f"Persona: {picks[i]['persona']}\nProduct: {picks[i]['product_title']}\nQuestion: {picks[i]['question']}",
+            )
+            for i in ug_idx
+        ]
+        ungrounded_answers = gen_batch(gen, ungrounded_prompts, MAX_NEW_TOKENS_ANS, temperature=0.9)
+        for i, ans in zip(ug_idx, ungrounded_answers):
+            picks[i]["ungrounded_answer"] = ans.strip()
+
+        # Assemble
+        for p in picks:
+            if not p.get("question") or not p.get("ungrounded_answer"):
                 continue
-
-        # results: list of dicts {'generated_text': "..."} or list of list/dicts depending on pipeline version
-        for item in results:
-            # handle both shapes: {'generated_text': '...'} or [{'generated_text': '...'}]
-            raw_text = None
-            if isinstance(item, dict) and "generated_text" in item:
-                raw_text = item["generated_text"]
-            elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], dict) and "generated_text" in item[0]:
-                raw_text = item[0]["generated_text"]
-            else:
-                # try to stringify item
-                raw_text = str(item)
-
-            data = extract_first_json(raw_text)
-            if not data:
-                continue
-
-            entry = {
-                "prompt": f"Persona: {random.choice(PERSONAS)}\nUser: {data.get('user_query','')}",
-                "chosen": data.get('chosen', ''),
-                "rejected": data.get('rejected', '')
+            prompt_text = f"Persona: {p['persona']}\nUser: {p['question']}"
+            base = {
+                "prompt": prompt_text,
+                "rejected": p["ungrounded_answer"],
+                "parent_asin": p["asin"],
+                "product_title": p["product_title"],
+                "aspect": p["aspect"],
+                "persona": p["persona"],
+                "evidence_review_ids": p["evidence_review_ids"],
             }
-            dataset.append(entry)
+            if p["sufficient_evidence"] and p.get("chosen"):
+                base.update({"chosen": p["chosen"], "category": "grounded_aspect"})
+            else:
+                base.update({
+                    "chosen": (
+                        f"Based on the available customer reviews for {p['product_title']}, there isn't enough "
+                        f"evidence about {p['aspect']} to give a confident answer. I don't want to guess -- "
+                        f"would you like me to tell you what the reviews do cover?"
+                    ),
+                    "category": "abstention",
+                })
+            dataset.append(base)
 
-        # optional early stop if we've reached N_SAMPLES
-        if len(dataset) >= N_SAMPLES:
-            break
+        pbar.update(len(picks))
 
-    # Fallback safety
-    if len(dataset) < 10:
-        print("Warning: Generation low yield. Adding dummy data.")
-        dataset.append({
-            "prompt": "Persona: Gamer\nUser: Best laptop?",
-            "chosen": "For gaming, look for RTX 40 series.",
-            "rejected": "I don't know."
-        })
+        # Checkpoint after every batch -- a killed/interrupted run (session
+        # teardown, OOM, etc.) loses at most one batch instead of everything.
+        with open(args.out, "w") as f:
+            json.dump(dataset, f, indent=2)
 
-    # Trim dataset to N_SAMPLES if overshot
-    dataset = dataset[:N_SAMPLES]
+    pbar.close()
 
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(dataset, f, indent=2)
+    n_grounded = sum(1 for d in dataset if d["category"] == "grounded_aspect")
+    n_abstain = sum(1 for d in dataset if d["category"] == "abstention")
+    print(f"Saved {len(dataset)} examples to {args.out} ({n_grounded} grounded_aspect, {n_abstain} abstention)")
 
-    print(f"Successfully saved {len(dataset)} samples to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
-

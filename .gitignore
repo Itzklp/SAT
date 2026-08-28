@@ -1,2 +1,8 @@
 .venv/
-datasets/
+dataset/
+labeled_bootstrap.json
+results/
+rufus_checkpoints/
+deberta_mini_phone_classifier/
+__pycache__/
+cache_librarian/
