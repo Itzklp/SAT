@@ -81,9 +81,12 @@ def safe_load_model(model_id, **kwargs):
             print("Retry with CPU (very slow). Error:", e2)
             return AutoModelForCausalLM.from_pretrained(model_id, device_map={"": "cpu"}, trust_remote_code=True)
 
-def load_raw_data():
-    with open(DATA_FILE, "r") as f:
+def load_raw_data(data_file=None, max_examples=None):
+    path = data_file or DATA_FILE
+    with open(path, "r") as f:
         data = json.load(f)
+    if max_examples is not None:
+        data = data[:max_examples]
     return Dataset.from_list(data)
 
 def prepare_tokenizer():
@@ -260,14 +263,16 @@ def run_dpo(dataset):
             remove_unused_columns=False,
             beta=0.1,
             max_length=1024,
-            max_prompt_length=512,
         )
         # IMPORTANT: do NOT pass tokenizer=tokenizer here (TRL v0.24.0 expects config in args).
+        # IMPORTANT: do NOT pass peft_config here either -- `model` is already a PeftModel
+        # (the SFT LoRA adapter, loaded with is_trainable=True above). DPO continues training
+        # that same adapter; passing peft_config would tell the trainer to apply a *second*,
+        # fresh LoRA on top, which newer trl versions correctly reject.
         dpo_trainer = DPOTrainer(
             model=model,
             ref_model=None,
             train_dataset=dpo_dataset,
-            peft_config=PEFT_CONFIG,
             args=dpo_cfg,
         )
     else:
@@ -288,7 +293,6 @@ def run_dpo(dataset):
             model=model,
             ref_model=None,
             train_dataset=dpo_dataset,
-            peft_config=PEFT_CONFIG,
             args=dpo_training_args,
         )
 
@@ -301,7 +305,27 @@ def run_dpo(dataset):
 # MAIN
 # -------------------------
 if __name__ == "__main__":
-    raw_dataset = load_raw_data()
-    run_sft(raw_dataset)
-    run_dpo(raw_dataset)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_file", type=str, default=None)
+    ap.add_argument("--max_examples", type=int, default=None, help="slice dataset for smoke testing")
+    ap.add_argument("--sft_only", action="store_true")
+    ap.add_argument("--dpo_only", action="store_true")
+    ap.add_argument("--output_dir", type=str, default=None)
+    args = ap.parse_args()
+
+    if args.output_dir:
+        OUTPUT_DIR = args.output_dir
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    raw_dataset = load_raw_data(args.data_file, args.max_examples)
+    print(f"Loaded {len(raw_dataset)} training examples.")
+
+    if args.dpo_only:
+        run_dpo(raw_dataset)
+    elif args.sft_only:
+        run_sft(raw_dataset)
+    else:
+        run_sft(raw_dataset)
+        run_dpo(raw_dataset)
 

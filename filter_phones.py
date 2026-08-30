@@ -1,4 +1,5 @@
 import warnings
+
 warnings.filterwarnings(
     "ignore",
     message=".*Failed to load image Python extension.*"
@@ -24,7 +25,13 @@ from transformers import (
 )
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score
+)
+
+from transformers import logging as hf_logging
 
 import torch
 import numpy as np
@@ -33,8 +40,6 @@ import numpy as np
 # ============================================================
 # Hugging Face / Transformers logging
 # ============================================================
-
-from transformers import logging as hf_logging
 
 hf_logging.set_verbosity_error()
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -54,22 +59,30 @@ REVIEWS_OUT = f"{DATA_PATH}/reviews_phones_only.jsonl.gz"
 
 MODEL_DIR = "./deberta_mini_phone_classifier"
 
-BOOTSTRAP_CACHE = "/content/drive/MyDrive/SAT/labeled_bootstrap.json"
+# IMPORTANT:
+# This is the cache created by the previous successful LLaMA run.
+BOOTSTRAP_CACHE = "./labeled_bootstrap.json"
+
 
 # Maximum number of products read from meta.jsonl.gz
-# None = process everything
 MAX_PRODUCTS = 1_000_000
+
 
 # DeBERTa inference batch size
 BATCH_SIZE = 32
+
 
 # LLaMA bootstrap settings
 BOOTSTRAP_SAMPLE_SIZE = 5000
 BOOTSTRAP_BATCH_SIZE = 4
 
-# Start fresh so the previous broken cache containing
-# only one label is not reused.
+
+# IMPORTANT:
+# False means:
+#   Reuse labeled_bootstrap.json
+#   DO NOT regenerate LLaMA labels
 FORCE_REFRESH_BOOTSTRAP = False
+
 
 DEVICE = 0 if torch.cuda.is_available() else -1
 
@@ -81,6 +94,7 @@ DEVICE = 0 if torch.cuda.is_available() else -1
 print("[1] Initializing LLaMA bootstrap generator...")
 
 LLAMA_MODEL = "NousResearch/Meta-Llama-3-8B-Instruct"
+
 
 quant_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -94,7 +108,10 @@ quant_config = BitsAndBytesConfig(
 # Load tokenizer
 # ------------------------------------------------------------
 
-llm_tokenizer = AutoTokenizer.from_pretrained(LLAMA_MODEL, padding_side="left")
+llm_tokenizer = AutoTokenizer.from_pretrained(
+    LLAMA_MODEL,
+    padding_side="left"
+)
 
 
 # ------------------------------------------------------------
@@ -115,7 +132,10 @@ llm_model = AutoModelForCausalLM.from_pretrained(
 if llm_tokenizer.pad_token is None:
     llm_tokenizer.pad_token = llm_tokenizer.eos_token
 
-llm_model.config.pad_token_id = llm_tokenizer.pad_token_id
+llm_model.config.pad_token_id = (
+    llm_tokenizer.pad_token_id
+)
+
 
 print("[1] LLaMA 3 8B loaded successfully.")
 
@@ -137,7 +157,7 @@ def bootstrap_labels(
         0 -> phone
         1 -> accessory
 
-    The generated labels will later be used to train
+    The generated labels are used to train
     the smaller DeBERTa classifier.
     """
 
@@ -152,8 +172,44 @@ def bootstrap_labels(
             f"from {BOOTSTRAP_CACHE}"
         )
 
-        with open(BOOTSTRAP_CACHE, "r") as f:
-            return json.load(f)
+        with open(
+            BOOTSTRAP_CACHE,
+            "r"
+        ) as f:
+
+            labeled = json.load(f)
+
+        # Validate cache
+        phone_count = sum(
+            x.get("label") == "phone"
+            for x in labeled
+        )
+
+        accessory_count = sum(
+            x.get("label") == "accessory"
+            for x in labeled
+        )
+
+        print(
+            f"[1] Cached labels: {len(labeled)}"
+        )
+
+        print(
+            f"[1] Cached phones: {phone_count}"
+        )
+
+        print(
+            f"[1] Cached accessories: {accessory_count}"
+        )
+
+        if phone_count == 0 or accessory_count == 0:
+
+            raise RuntimeError(
+                "Cached bootstrap file does not "
+                "contain both classes."
+            )
+
+        return labeled
 
 
     # --------------------------------------------------------
@@ -172,22 +228,32 @@ def bootstrap_labels(
 
         for i, line in enumerate(f):
 
-            if MAX_PRODUCTS and i >= MAX_PRODUCTS:
+            if (
+                MAX_PRODUCTS
+                and i >= MAX_PRODUCTS
+            ):
                 break
 
             try:
                 obj = json.loads(line)
+
             except json.JSONDecodeError:
                 continue
 
-            title = obj.get("title", "")
+            title = obj.get(
+                "title",
+                ""
+            )
 
             if title:
-                titles.append((obj, title))
+                titles.append(
+                    (obj, title)
+                )
 
 
     print(
-        f"[1] Available titles: {len(titles):,}"
+        f"[1] Available titles: "
+        f"{len(titles):,}"
     )
 
 
@@ -204,6 +270,7 @@ def bootstrap_labels(
         titles,
         sample_size
     )
+
 
     print(
         f"[1] Selected {len(sample):,} titles "
@@ -262,7 +329,11 @@ def bootstrap_labels(
 
 
     for i in tqdm(
-        range(0, len(prompts), batch_size),
+        range(
+            0,
+            len(prompts),
+            batch_size
+        ),
         desc="Bootstrapping labels with LLM"
     ):
 
@@ -293,7 +364,9 @@ def bootstrap_labels(
         }
 
 
-        input_length = inputs["input_ids"].shape[1]
+        input_length = (
+            inputs["input_ids"].shape[1]
+        )
 
 
         # ----------------------------------------------------
@@ -306,51 +379,57 @@ def bootstrap_labels(
                 **inputs,
                 max_new_tokens=4,
                 do_sample=False,
-                pad_token_id=llm_tokenizer.pad_token_id
+                pad_token_id=(
+                    llm_tokenizer.pad_token_id
+                )
             )
 
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        # Keep ONLY newly generated tokens.
-        #
-        # The original prompt is removed.
+        # Keep only generated tokens
         # ----------------------------------------------------
 
-        generated_tokens = outputs[:, input_length:]
+        generated_tokens = (
+            outputs[:, input_length:]
+        )
 
 
-        decoded_outputs = llm_tokenizer.batch_decode(
-            generated_tokens,
-            skip_special_tokens=True
+        decoded_outputs = (
+            llm_tokenizer.batch_decode(
+                generated_tokens,
+                skip_special_tokens=True
+            )
         )
 
 
         # ----------------------------------------------------
-        # Parse each answer
+        # Parse answers
         # ----------------------------------------------------
 
-        for (_, title), result_text in zip(
+        for (
+            (_, title),
+            result_text
+        ) in zip(
             sample[i:i + batch_size],
             decoded_outputs
         ):
 
-            output = result_text.strip().lower()
+            output = (
+                result_text
+                .strip()
+                .lower()
+            )
 
 
-            # Remove punctuation
             output = re.sub(
                 r"[^a-zA-Z ]",
                 " ",
                 output
             )
 
+
             output = output.strip()
 
-
-            # ------------------------------------------------
-            # Determine label
-            # ------------------------------------------------
 
             if re.search(
                 r"\baccessory\b",
@@ -361,7 +440,6 @@ def bootstrap_labels(
 
                 accessory_count += 1
 
-
             elif re.search(
                 r"\bphone\b",
                 output
@@ -371,17 +449,12 @@ def bootstrap_labels(
 
                 phone_count += 1
 
-
             else:
 
                 label = None
 
                 unknown_count += 1
 
-
-            # ------------------------------------------------
-            # Store valid label
-            # ------------------------------------------------
 
             if label is not None:
 
@@ -394,7 +467,7 @@ def bootstrap_labels(
 
 
         # ----------------------------------------------------
-        # Progress information every 100 batches
+        # Progress information
         # ----------------------------------------------------
 
         if (
@@ -415,22 +488,28 @@ def bootstrap_labels(
     # Bootstrap complete
     # ========================================================
 
-    print("\n[1] Bootstrap generation completed.")
-
     print(
-        f"[1] Total valid labels: {len(labeled)}"
+        "\n[1] Bootstrap generation completed."
     )
 
     print(
-        f"[1] Phones: {phone_count}"
+        f"[1] Total valid labels: "
+        f"{len(labeled)}"
     )
 
     print(
-        f"[1] Accessories: {accessory_count}"
+        f"[1] Phones: "
+        f"{phone_count}"
     )
 
     print(
-        f"[1] Unknown/unusable: {unknown_count}"
+        f"[1] Accessories: "
+        f"{accessory_count}"
+    )
+
+    print(
+        f"[1] Unknown/unusable: "
+        f"{unknown_count}"
     )
 
 
@@ -438,7 +517,10 @@ def bootstrap_labels(
     # Safety check
     # --------------------------------------------------------
 
-    if phone_count == 0 or accessory_count == 0:
+    if (
+        phone_count == 0
+        or accessory_count == 0
+    ):
 
         raise RuntimeError(
             "\nLLaMA did not produce both classes.\n"
@@ -449,7 +531,7 @@ def bootstrap_labels(
 
 
     # --------------------------------------------------------
-    # Save cache AFTER all batches finish
+    # Save cache
     # --------------------------------------------------------
 
     with open(
@@ -479,16 +561,12 @@ def bootstrap_labels(
 
 def train_deberta(labeled):
 
-    print(
-        "[2] Preparing DeBERTa training data..."
-    )
-
+    print("[2] Preparing DeBERTa training data...")
 
     labels = {
         "phone": 0,
         "accessory": 1
     }
-
 
     # --------------------------------------------------------
     # Convert labels
@@ -503,7 +581,6 @@ def train_deberta(labeled):
         labels[ex["label"]]
         for ex in labeled
     ]
-
 
     # --------------------------------------------------------
     # Separate classes
@@ -521,7 +598,6 @@ def train_deberta(labeled):
         if l == 1
     ]
 
-
     print(
         f"[2] Phone labels: {len(phones)}"
     )
@@ -530,32 +606,27 @@ def train_deberta(labeled):
         f"[2] Accessory labels: {len(accessories)}"
     )
 
+    # --------------------------------------------------------
+    # BALANCE CLASSES
+    # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # Balance classes
-    # --------------------------------------------------------
+    random.seed(42)
+
+    random.shuffle(phones)
+    random.shuffle(accessories)
 
     min_len = min(
         len(phones),
         len(accessories)
     )
 
-
     if min_len < 2:
-
         raise RuntimeError(
-            "Not enough examples in both classes "
-            "to train DeBERTa."
+            "Not enough examples in both classes."
         )
-
-
-    random.shuffle(phones)
-    random.shuffle(accessories)
-
 
     phones = phones[:min_len]
     accessories = accessories[:min_len]
-
 
     texts_balanced = (
         phones +
@@ -567,41 +638,53 @@ def train_deberta(labeled):
         [1] * min_len
     )
 
+    print(
+        f"[2] After balancing -- "
+        f"phone: {len(phones)}, "
+        f"accessory: {len(accessories)}"
+    )
 
     print(
-        f"[2] Balanced training examples: "
+        f"[2] Total balanced examples: "
         f"{len(texts_balanced)}"
     )
 
-
     # --------------------------------------------------------
-    # Train/validation split
+    # Train / validation split
     # --------------------------------------------------------
 
-    train_texts, val_texts, train_labels, val_labels = (
-        train_test_split(
-            texts_balanced,
-            y_balanced,
-            test_size=0.2,
-            random_state=42,
-            stratify=y_balanced
-        )
+    (
+        train_texts,
+        val_texts,
+        train_labels,
+        val_labels
+    ) = train_test_split(
+        texts_balanced,
+        y_balanced,
+        test_size=0.2,
+        random_state=42,
+        stratify=y_balanced
     )
 
-
-    # --------------------------------------------------------
-    # DeBERTa tokenizer
-    # --------------------------------------------------------
-
-    model_name = (
-        "microsoft/deberta-v3-small"
+    print(
+        f"[2] Training examples: "
+        f"{len(train_texts)}"
     )
 
+    print(
+        f"[2] Validation examples: "
+        f"{len(val_texts)}"
+    )
+
+    # --------------------------------------------------------
+    # Tokenizer
+    # --------------------------------------------------------
+
+    model_name = "microsoft/deberta-v3-small"
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_name
     )
-
 
     def tokenize(batch):
 
@@ -611,7 +694,6 @@ def train_deberta(labeled):
             truncation=True,
             max_length=128
         )
-
 
     # --------------------------------------------------------
     # Create datasets
@@ -631,7 +713,6 @@ def train_deberta(labeled):
         }
     )
 
-
     # --------------------------------------------------------
     # Tokenize
     # --------------------------------------------------------
@@ -646,49 +727,103 @@ def train_deberta(labeled):
         batched=True
     )
 
+    # IMPORTANT:
+    # Remove raw text so Trainer only receives tensors
+    train_dataset = train_dataset.remove_columns(
+        ["text"]
+    )
+
+    val_dataset = val_dataset.remove_columns(
+        ["text"]
+    )
+
+    # Explicitly use torch format
+    train_dataset.set_format(
+        "torch"
+    )
+
+    val_dataset.set_format(
+        "torch"
+    )
 
     # --------------------------------------------------------
     # Load DeBERTa
     # --------------------------------------------------------
 
-    model = (
-        AutoModelForSequenceClassification
-        .from_pretrained(
-            model_name,
-            num_labels=2
-        )
+    print("[2] Loading DeBERTa-small...")
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=2
     )
 
+    # --------------------------------------------------------
+    # FORCE FP32
+    # --------------------------------------------------------
+
+    model = model.float()
+
+    # Make sure parameters are finite before training
+    for name, param in model.named_parameters():
+
+        if not torch.isfinite(param).all():
+
+            raise RuntimeError(
+                f"Non-finite parameter before training: {name}"
+            )
 
     # --------------------------------------------------------
     # Training arguments
     # --------------------------------------------------------
 
     training_args = TrainingArguments(
+
         output_dir="./results",
 
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
+        # Smaller batch = safer memory usage
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
 
-        num_train_epochs=2,
+        num_train_epochs=3,
 
+        # IMPORTANT
+        # Disable mixed precision
+        fp16=False,
+        bf16=False,
+
+        # Conservative LR
+        learning_rate=1e-5,
+
+        # Prevent exploding gradients
+        max_grad_norm=1.0,
+
+        weight_decay=0.01,
+
+        # Evaluate after every epoch
+        eval_strategy="epoch",
+
+        # Do not save intermediate checkpoints
         save_strategy="no",
 
-        report_to="none"
-    )
+        report_to="none",
 
+        # Reproducibility
+        seed=42,
+
+        # Avoid multiprocessing problems
+        dataloader_num_workers=0
+    )
 
     # --------------------------------------------------------
     # Trainer
     # --------------------------------------------------------
 
     trainer = Trainer(
-      model=model,
-      args=training_args,
-      train_dataset=train_dataset,
-      eval_dataset=val_dataset
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset
     )
-
 
     # --------------------------------------------------------
     # Train
@@ -700,6 +835,38 @@ def train_deberta(labeled):
 
     trainer.train()
 
+    # --------------------------------------------------------
+    # Check model parameters after training
+    # --------------------------------------------------------
+
+    print(
+        "[2] Checking trained model..."
+    )
+
+    bad_parameters = []
+
+    for name, parameter in model.named_parameters():
+
+        if not torch.isfinite(parameter).all():
+
+            bad_parameters.append(name)
+
+    if bad_parameters:
+
+        print(
+            "[2] Non-finite parameters detected:"
+        )
+
+        for name in bad_parameters:
+            print(
+                "   ",
+                name
+            )
+
+        raise RuntimeError(
+            "DeBERTa training produced NaN/Inf "
+            "parameters. Model will NOT be saved."
+        )
 
     # --------------------------------------------------------
     # Validation
@@ -713,12 +880,29 @@ def train_deberta(labeled):
         val_dataset
     )
 
+    prediction_logits = preds.predictions
+
+    # --------------------------------------------------------
+    # Check predictions
+    # --------------------------------------------------------
+
+    if not np.isfinite(
+        prediction_logits
+    ).all():
+
+        raise RuntimeError(
+            "DeBERTa produced NaN/Inf predictions. "
+            "Classifier will NOT be saved."
+        )
 
     y_pred = np.argmax(
-        preds.predictions,
+        prediction_logits,
         axis=1
     )
 
+    # --------------------------------------------------------
+    # Classification report
+    # --------------------------------------------------------
 
     print(
         classification_report(
@@ -727,10 +911,14 @@ def train_deberta(labeled):
             target_names=[
                 "phone",
                 "accessory"
-            ]
+            ],
+            zero_division=0
         )
     )
 
+    # --------------------------------------------------------
+    # Confusion matrix
+    # --------------------------------------------------------
 
     print(
         "Confusion Matrix:"
@@ -743,7 +931,6 @@ def train_deberta(labeled):
         )
     )
 
-
     # --------------------------------------------------------
     # Save model
     # --------------------------------------------------------
@@ -753,7 +940,6 @@ def train_deberta(labeled):
         exist_ok=True
     )
 
-
     model.save_pretrained(
         MODEL_DIR
     )
@@ -762,11 +948,9 @@ def train_deberta(labeled):
         MODEL_DIR
     )
 
-
     print(
         f"[2] Model saved to {MODEL_DIR}"
     )
-
 
     return tokenizer, model
 
@@ -883,7 +1067,11 @@ def _process_batch(
         )
 
 
-    for obj, pred, score in zip(
+    for (
+        obj,
+        pred,
+        score
+    ) in zip(
         batch_objs,
         preds,
         scores
@@ -905,7 +1093,10 @@ def _process_batch(
             pred_label == "phone"
             and score > 0.60
             and not regex_filter(
-                obj.get("title", "")
+                obj.get(
+                    "title",
+                    ""
+                )
             )
         ):
 
@@ -988,8 +1179,11 @@ def filter_dataset(
 
 
             try:
+
                 obj = json.loads(line)
+
             except json.JSONDecodeError:
+
                 continue
 
 
@@ -1000,11 +1194,17 @@ def filter_dataset(
 
 
             if not title:
+
                 continue
 
 
-            batch_objs.append(obj)
-            batch_texts.append(title)
+            batch_objs.append(
+                obj
+            )
+
+            batch_texts.append(
+                title
+            )
 
 
             total_products += 1
@@ -1101,8 +1301,11 @@ def filter_dataset(
 
 
             try:
+
                 obj = json.loads(line)
+
             except json.JSONDecodeError:
+
                 continue
 
 
@@ -1232,4 +1435,5 @@ def run_pipeline():
 # ============================================================
 
 if __name__ == "__main__":
+
     run_pipeline()
