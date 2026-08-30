@@ -1,4 +1,4 @@
-# SAT — Smartphone Amazon-review Assistant
+# SAT — Conversational AI for E-commerce Review Summarization
 
 A conversational, evidence-grounded review-analysis system for the smartphone domain, built on **NousResearch/Meta-Llama-3-8B-Instruct** fine-tuned with **SFT + DPO**, wrapped in a four-layer inference pipeline (**Doorman → Librarian → Analyst → Spokesperson**) that retrieves real review sentences for a product and answers questions *only* from that evidence — abstaining when the evidence isn't there instead of guessing.
 
